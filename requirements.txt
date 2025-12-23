@@ -14,6 +14,7 @@ sentence-transformers==5.1.2
 
 # Utilities
 requests
+httpx
 wikipedia
 tiktoken
 typing_extensions

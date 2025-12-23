@@ -109,8 +109,17 @@ def get_llm(temperature: float = 0.0, model: Optional[str] = None) -> ChatOpenAI
     _configure_openai_debug_logging()
 
     timeout_s = int((os.getenv("OPENAI_REQUEST_TIMEOUT") or "60").strip() or "60")
+    max_retries = int((os.getenv("OPENAI_MAX_RETRIES") or "2").strip() or "2")
+    if max_retries < 0:
+        max_retries = 0
 
-    return ChatOpenAI(model_name=final_model, temperature=temperature, request_timeout=timeout_s)
+    # LangChain 0.0.352 的 ChatOpenAI 支持 max_retries/request_timeout，底层会对 429/临时网络错误做重试。
+    return ChatOpenAI(
+        model_name=final_model,
+        temperature=temperature,
+        request_timeout=timeout_s,
+        max_retries=max_retries,
+    )
 
 
 def get_tools(llm: ChatOpenAI):

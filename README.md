@@ -23,6 +23,7 @@
 - `GET /health`：健康检查
 - `POST /v1/chat`：多轮对话入口（前端使用）
 - `POST /v1/triage`：单次分诊入口（便于独立调试）
+- `POST /v1/agent/chat_v2`：LangGraph 医患问诊 Agent（多轮 + 结构化追问 + trace）
 
 ---
 
@@ -108,6 +109,10 @@ $env:KMP_DUPLICATE_LIB_OK = "TRUE"
 uvicorn app.api_server:app --host 127.0.0.1 --port 8000
 ```
 
+如需启用本地 RAG 证据（向量库不随仓库提交）：
+- 把你的 `kb_store`（Chroma 持久化目录）放到本机云盘同步路径
+- 在 `.env` 里设置 `RAG_PERSIST_DIR` 为该目录的绝对路径
+
 健康检查：打开 `http://127.0.0.1:8000/health`，应返回 `{"status":"ok"}`。
 
 ### 4) 启动前端
@@ -129,13 +134,22 @@ npm run dev
 - `OUTPUT_DIR`：默认 `outputs`，保存 `/v1/chat` 的 session 轨迹
 - `ALLOW_SAVE_SESSION_RAW_TEXT=1`：可选，落盘保存原文（不推荐，注意隐私）
 - `CHAT_SLOT_EXTRACTOR=rules`：可选，强制不用 LLM 抽槽（用于离线测试/稳定性）
+- `AGENT_SLOT_EXTRACTOR=rules`：可选，强制 `/v1/agent/chat_v2` 不用 LLM 抽槽（用于离线测试/CI）
 
 Windows 兼容性：
 - 若出现 OpenMP 冲突（`libiomp5md.dll already initialized`），可设置 `KMP_DUPLICATE_LIB_OK=TRUE` 再启动后端。
 
 ---
 
+## 验收要点（Agent v2）
+
+- 多轮同 session：前端会自动保存 `session_id`，连续发送多条消息应保持不变。
+- 追问交互：当后端返回 `mode=ask` 时，追问面板的按钮/选项点击后发送的是“答案文本”，不会把追问问题句子当成用户输入发回去。
+- 防复读护栏：如果手动把追问问题原样复制到输入框并发送，前端会拦截并提示“请直接回答追问内容”。
+
 ## 清理与安全建议（重要）
 
 - 不要把 API Key 写进代码或提交到仓库；推荐放在本地 `.env`。
 - `outputs/`、`__pycache__/`、`.pytest_cache/` 都是生成物/缓存（已在 `.gitignore` 中忽略）。
+- `app/rag/kb_store/`（Chroma 持久化向量库）体积可能很大，默认不提交；克隆后可运行入库脚本重新生成。
+- `app/rag/kb_docs/dataset-v2/`、`app/MedDG_UTF8/` 属于数据集/评测数据，默认不提交；需要评测时请自行准备数据后再运行评测脚本。

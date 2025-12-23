@@ -110,6 +110,14 @@ class ChatRequest(BaseModel):
     mode: Literal["fast", "safe"] = Field("fast", description="同 /v1/triage；默认会被API策略强制为safe")
 
 
+class RagRetrieveRequest(BaseModel):
+    query: str = Field(..., description="检索 query")
+    top_k: int = Field(5, ge=1, le=20, description="最终返回条数")
+    top_n: int = Field(30, ge=1, le=200, description="第一阶段向量召回条数")
+    department: Optional[str] = Field(None, description="可选：科室过滤（严格等值匹配）")
+    use_rerank: Optional[bool] = Field(None, description="可选：是否启用 rerank（默认按环境变量）")
+
+
 def _env_flag(name: str, default: str = "0") -> bool:
     v = os.getenv(name, default)
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -140,6 +148,16 @@ def _get_output_dir() -> Path:
 
 def _sha256_text(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def _safe_query_for_log(query: str) -> str:
+    q = (query or "").strip()
+    if not q:
+        return "(empty)"
+    prefix = q[:100]
+    if len(q) <= 100:
+        return prefix
+    return f"{prefix}…(sha256={_sha256_text(q)[:12]})"
 
 
 def _text_meta(text: Optional[str]) -> Dict[str, Any]:
@@ -978,6 +996,16 @@ app = FastAPI(
 )
 
 
+# M2：AgentOrchestration（LangGraph）路由挂载。
+# 采用延迟导入，避免启动阶段强制加载模型或引入不必要依赖。
+try:
+    from app.agent.router import router as agent_router  # type: ignore
+
+    app.include_router(agent_router)
+except Exception as e:
+    logger.warning("M2 agent router not loaded: %s", e)
+
+
 @app.middleware("http")
 async def add_trace_id_middleware(request: Request, call_next):
     trace_id = str(uuid4())
@@ -1014,6 +1042,76 @@ app.add_middleware(
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"status": "ok"}
+
+
+@app.get("/v1/rag/stats")
+def rag_stats() -> Dict[str, Any]:
+    """RAG 底座状态。
+
+    注意：该接口不涉及会话上下文，不会输出用户原始会话文本。
+    """
+
+    from app.rag.rag_core import get_stats  # 延迟导入，避免启动时强制加载模型
+
+    st = get_stats()
+    return {
+        "collection": st.collection,
+        "count": st.count,
+        "persist_dir": st.persist_dir,
+        "device": st.device,
+        "embed_model": st.embed_model,
+        "rerank_model": st.rerank_model,
+        "updated_at": st.updated_at,
+    }
+
+
+@app.post("/v1/rag/retrieve")
+def rag_retrieve(
+    request: Request,
+    req: RagRetrieveRequest,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> Dict[str, Any]:
+    """独立 RAG 检索接口。
+
+    日志安全：仅打印 query 前 100 字符或哈希。
+    """
+
+    trace_id = _get_trace_id(request)
+
+    auth_resp = _auth_guard(x_api_key, trace_id)
+    if auth_resp is not None:
+        return auth_resp  # type: ignore[return-value]
+
+    from app.rag.rag_core import get_stats, retrieve
+
+    q = (req.query or "").strip()
+    logger.info("RAG_RETRIEVE trace_id=%s query=%s top_k=%s top_n=%s dept=%s", trace_id, _safe_query_for_log(q), req.top_k, req.top_n, (req.department or ""))
+
+    evidence = retrieve(
+        q,
+        top_k=req.top_k,
+        top_n=req.top_n,
+        department=req.department,
+        use_rerank=req.use_rerank,
+    )
+    st = get_stats()
+
+    effective_use_rerank = req.use_rerank if req.use_rerank is not None else _env_flag("RAG_USE_RERANKER", "1")
+
+    return {
+        "query": q,
+        "top_k": int(req.top_k),
+        "top_n": int(req.top_n),
+        "use_rerank": bool(effective_use_rerank),
+        "evidence": evidence,
+        "stats": {
+            "collection": st.collection,
+            "count": st.count,
+            "device": st.device,
+            "embed_model": st.embed_model,
+            "rerank_model": st.rerank_model,
+        },
+    }
 
 
 def _auth_guard(x_api_key: Optional[str], trace_id: str) -> Optional[JSONResponse]:
