@@ -107,17 +107,21 @@ def resolve_embedding_device() -> str:
     """Resolve embedding device.
 
     Env priority (new -> old):
-    - RAG_DEVICE: auto|cuda|cpu (or cuda:0)
-    - RAG_EMBEDDING_DEVICE: auto|cuda|cpu (or cuda:0)
+    - RAG_DEVICE: auto|cuda|mps|cpu (or cuda:0)
+    - RAG_EMBEDDING_DEVICE: auto|cuda|mps|cpu (or cuda:0)
 
-    - auto (default): use cuda if available, else cpu.
-    - cuda / cuda:0: require torch + CUDA.
+    - auto (default): use cuda if available, else mps (Apple Silicon), else cpu.
+    - cuda / cuda:0: require torch + CUDA (NVIDIA GPU).
+    - mps: require torch + MPS (Apple Silicon GPU).
+    - cpu: use CPU.
     """
     raw = (env_str("RAG_DEVICE", "") or env_str("RAG_EMBEDDING_DEVICE", "auto") or "auto").strip()
     raw_l = raw.lower()
     if raw_l == "gpu":
         raw_l = "cuda"
+
     if raw_l != "auto":
+        # Explicit CUDA request
         if raw_l.startswith("cuda"):
             try:
                 import torch  # type: ignore
@@ -133,18 +137,46 @@ def resolve_embedding_device() -> str:
                     "可能原因：未安装CUDA版torch/驱动不匹配/无GPU。\n"
                     "解决：安装匹配CUDA的torch与驱动，或改用 RAG_DEVICE=cpu。"
                 )
-        if raw_l in {"cpu"}:
+            return raw_l
+
+        # Explicit MPS request (Apple Silicon)
+        if raw_l == "mps":
+            try:
+                import torch  # type: ignore
+            except Exception as e:
+                raise RuntimeError(
+                    "已设置 RAG_DEVICE=mps，但当前环境缺少 torch。\n"
+                    "解决：安装 torch（pip install torch），或改用 RAG_DEVICE=cpu。"
+                ) from e
+            if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
+                raise RuntimeError(
+                    "已设置 RAG_DEVICE=mps，但 torch.backends.mps.is_available() 为 False。\n"
+                    "可能原因：非 Apple Silicon 设备/macOS 版本过低/torch 版本不支持 MPS。\n"
+                    "解决：确认是 Apple Silicon Mac 且 macOS >= 12.3，或改用 RAG_DEVICE=cpu。"
+                )
+            return "mps"
+
+        if raw_l == "cpu":
             return "cpu"
+
         return raw_l
 
-    # auto
+    # auto: CUDA > MPS > CPU
     try:
         import torch  # type: ignore
 
+        # Check CUDA first (NVIDIA GPU)
         if bool(getattr(torch.cuda, "is_available", lambda: False)()):
             return "cuda"
+
+        # Check MPS (Apple Silicon GPU)
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            # Additional check: MPS must be built
+            if torch.backends.mps.is_built():
+                return "mps"
     except Exception:
         pass
+
     return "cpu"
 
 
@@ -175,6 +207,7 @@ def make_embeddings() -> Tuple[object, EmbeddingInfo]:
     """Create embedding function for LangChain/Chroma.
 
     Default provider is BCEmbedding; if unavailable, fallback to HuggingFaceEmbeddings with a clear warning.
+    Supports CUDA, MPS (Apple Silicon), and CPU. MPS will fallback to CPU if not supported.
     """
     apply_windows_openmp_workaround()
 
@@ -201,19 +234,37 @@ def make_embeddings() -> Tuple[object, EmbeddingInfo]:
                 def __init__(self, name: str, dev: str):
                     self._name = name
                     self._dev = dev
+                    self._actual_dev = dev  # Track actual device used
                     self._model = None
 
                 def _get_model(self):
                     if self._model is not None:
                         return self._model
-                    # compatible constructor signatures
-                    try:
-                        self._model = EmbeddingModel(model_name_or_path=self._name, device=self._dev)
-                    except TypeError:
+
+                    def try_load(d: str):
                         try:
-                            self._model = EmbeddingModel(self._name, device=self._dev)
+                            return EmbeddingModel(model_name_or_path=self._name, device=d)
                         except TypeError:
-                            self._model = EmbeddingModel(self._name)
+                            try:
+                                return EmbeddingModel(self._name, device=d)
+                            except TypeError:
+                                return EmbeddingModel(self._name)
+
+                    try:
+                        self._model = try_load(self._dev)
+                        self._actual_dev = self._dev
+                    except Exception as e:
+                        # MPS fallback to CPU
+                        if self._dev == "mps":
+                            print(
+                                f"[RAG_EMBED] WARN mps_fallback reason={type(e).__name__}: {e}",
+                                flush=True,
+                            )
+                            self._model = try_load("cpu")
+                            self._actual_dev = "cpu"
+                            print("[RAG_EMBED] INFO fallback_to_cpu success", flush=True)
+                        else:
+                            raise
                     return self._model
 
                 def embed_documents(self, texts: List[str]) -> List[List[float]]:

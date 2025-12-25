@@ -119,6 +119,17 @@ def get_embedder() -> Tuple[Any, EmbeddingInfo]:
         return _cached_embed
 
 
+def _try_load_reranker(model_name: str, device: str):
+    """尝试加载 reranker 模型，返回 (model, actual_device)。"""
+    from BCEmbedding.models import RerankerModel  # type: ignore
+
+    try:
+        return RerankerModel(model_name_or_path=model_name, device=device), device
+    except TypeError:
+        # 兼容旧签名
+        return RerankerModel(model_name, device=device), device
+
+
 def get_reranker() -> Optional[Any]:
     """获取 reranker（单例缓存）。
 
@@ -126,6 +137,7 @@ def get_reranker() -> Optional[Any]:
     - 默认启用（RAG_USE_RERANKER=1）。
     - 如果明确关闭（RAG_USE_RERANKER=0），返回 None。
     - 如果启用但模型/依赖不可用，抛出可读错误信息。
+    - 支持 CUDA、MPS、CPU 设备，MPS 不可用时自动降级到 CPU。
     """
     global _cached_reranker
 
@@ -154,16 +166,35 @@ def get_reranker() -> Optional[Any]:
             ) from e
 
         try:
-            _cached_reranker = RerankerModel(model_name_or_path=model_name, device=device)
-        except TypeError:
-            # 兼容旧签名
-            _cached_reranker = RerankerModel(model_name, device=device)
+            _cached_reranker, actual_device = _try_load_reranker(model_name, device)
+            if actual_device != device:
+                print(
+                    f"[RAG_RERANK] INFO device_fallback from={device} to={actual_device}",
+                    flush=True,
+                )
         except Exception as e:
-            raise RuntimeError(
-                "BCEmbedding reranker 模型加载失败。\n"
-                f"model={model_name} device={device}\n"
-                f"错误：{type(e).__name__}: {e}"
-            ) from e
+            # MPS 可能不完全支持某些操作，尝试降级到 CPU
+            if device == "mps":
+                print(
+                    f"[RAG_RERANK] WARN mps_fallback reason={type(e).__name__}: {e}",
+                    flush=True,
+                )
+                try:
+                    _cached_reranker, _ = _try_load_reranker(model_name, "cpu")
+                    print("[RAG_RERANK] INFO fallback_to_cpu success", flush=True)
+                except Exception as e2:
+                    raise RuntimeError(
+                        "BCEmbedding reranker 模型加载失败（MPS 和 CPU 均失败）。\n"
+                        f"model={model_name}\n"
+                        f"MPS 错误：{type(e).__name__}: {e}\n"
+                        f"CPU 错误：{type(e2).__name__}: {e2}"
+                    ) from e2
+            else:
+                raise RuntimeError(
+                    "BCEmbedding reranker 模型加载失败。\n"
+                    f"model={model_name} device={device}\n"
+                    f"错误：{type(e).__name__}: {e}"
+                ) from e
 
         return _cached_reranker
 
