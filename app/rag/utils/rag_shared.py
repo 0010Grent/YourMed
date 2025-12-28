@@ -218,7 +218,7 @@ def make_embeddings() -> Tuple[object, EmbeddingInfo]:
     ).lower()
     device = resolve_embedding_device()
 
-    # BCE (preferred)
+    # BCE (preferred) - 使用 sentence-transformers 加载，支持 MPS
     if provider_requested in {"bce", "bcembedding"}:
         model_name = (
             env_str("RAG_EMBED_MODEL", "")
@@ -226,33 +226,30 @@ def make_embeddings() -> Tuple[object, EmbeddingInfo]:
             or DEFAULT_BCE_MODEL
         )
         try:
-            from BCEmbedding import EmbeddingModel  # type: ignore
+            from sentence_transformers import SentenceTransformer  # type: ignore
 
             Embeddings = _import_embeddings_interface()
 
             class BCEEmbeddings(Embeddings):
+                """BCE Embeddings using sentence-transformers (supports MPS)."""
+
                 def __init__(self, name: str, dev: str):
                     self._name = name
                     self._dev = dev
-                    self._actual_dev = dev  # Track actual device used
+                    self._actual_dev = dev
                     self._model = None
 
-                def _get_model(self):
+                def _get_model(self) -> SentenceTransformer:
                     if self._model is not None:
                         return self._model
 
-                    def try_load(d: str):
-                        try:
-                            return EmbeddingModel(model_name_or_path=self._name, device=d)
-                        except TypeError:
-                            try:
-                                return EmbeddingModel(self._name, device=d)
-                            except TypeError:
-                                return EmbeddingModel(self._name)
-
                     try:
-                        self._model = try_load(self._dev)
+                        self._model = SentenceTransformer(self._name, device=self._dev)
                         self._actual_dev = self._dev
+                        print(
+                            f"[RAG_EMBED] INFO model={self._name} device={self._dev}",
+                            flush=True,
+                        )
                     except Exception as e:
                         # MPS fallback to CPU
                         if self._dev == "mps":
@@ -260,7 +257,7 @@ def make_embeddings() -> Tuple[object, EmbeddingInfo]:
                                 f"[RAG_EMBED] WARN mps_fallback reason={type(e).__name__}: {e}",
                                 flush=True,
                             )
-                            self._model = try_load("cpu")
+                            self._model = SentenceTransformer(self._name, device="cpu")
                             self._actual_dev = "cpu"
                             print("[RAG_EMBED] INFO fallback_to_cpu success", flush=True)
                         else:
@@ -269,7 +266,7 @@ def make_embeddings() -> Tuple[object, EmbeddingInfo]:
 
                 def embed_documents(self, texts: List[str]) -> List[List[float]]:
                     m = self._get_model()
-                    vecs = m.encode(texts)
+                    vecs = m.encode(texts, show_progress_bar=False)
                     try:
                         return [v.tolist() for v in vecs]
                     except Exception:
@@ -277,7 +274,7 @@ def make_embeddings() -> Tuple[object, EmbeddingInfo]:
 
                 def embed_query(self, text: str) -> List[float]:
                     m = self._get_model()
-                    vecs = m.encode([text])
+                    vecs = m.encode([text], show_progress_bar=False)
                     v = vecs[0]
                     try:
                         return v.tolist()
@@ -296,7 +293,7 @@ def make_embeddings() -> Tuple[object, EmbeddingInfo]:
             )
         except Exception as e:
             # fall back below
-            fallback_reason = f"BCEmbedding不可用：{type(e).__name__}: {e}"
+            fallback_reason = f"sentence-transformers加载BCE模型失败：{type(e).__name__}: {e}"
 
             provider_requested = provider_requested  # keep
             # continue to HF fallback
@@ -307,8 +304,8 @@ def make_embeddings() -> Tuple[object, EmbeddingInfo]:
                 from langchain.embeddings import HuggingFaceEmbeddings  # type: ignore
             except Exception as e2:
                 raise RuntimeError(
-                    "BCEmbedding 不可用，且缺少 HuggingFaceEmbeddings（langchain 依赖不完整）。\n"
-                    f"BCEmbedding error: {fallback_reason}\n"
+                    "sentence-transformers 不可用，且缺少 HuggingFaceEmbeddings（langchain 依赖不完整）。\n"
+                    f"sentence-transformers error: {fallback_reason}\n"
                     f"HF error: {type(e2).__name__}: {e2}"
                 ) from e2
 

@@ -119,15 +119,24 @@ def get_embedder() -> Tuple[Any, EmbeddingInfo]:
         return _cached_embed
 
 
-def _try_load_reranker(model_name: str, device: str):
-    """尝试加载 reranker 模型，返回 (model, actual_device)。"""
-    from BCEmbedding.models import RerankerModel  # type: ignore
+class _CrossEncoderWrapper:
+    """Wrapper to make CrossEncoder compatible with BCEmbedding RerankerModel API."""
 
-    try:
-        return RerankerModel(model_name_or_path=model_name, device=device), device
-    except TypeError:
-        # 兼容旧签名
-        return RerankerModel(model_name, device=device), device
+    def __init__(self, model_name: str, device: str):
+        from sentence_transformers import CrossEncoder  # type: ignore
+
+        self._model = CrossEncoder(model_name, device=device)
+        self._device = device
+        print(f"[RAG_RERANK] INFO model={model_name} device={device}", flush=True)
+
+    def compute_score(self, pairs, enable_tqdm: bool = False):
+        """Compatible with BCEmbedding RerankerModel.compute_score()."""
+        return self._model.predict(pairs, show_progress_bar=enable_tqdm)
+
+
+def _try_load_reranker(model_name: str, device: str):
+    """尝试加载 reranker 模型，返回 (model, actual_device)。使用 CrossEncoder 支持 MPS。"""
+    return _CrossEncoderWrapper(model_name, device), device
 
 
 def get_reranker() -> Optional[Any]:
@@ -138,6 +147,7 @@ def get_reranker() -> Optional[Any]:
     - 如果明确关闭（RAG_USE_RERANKER=0），返回 None。
     - 如果启用但模型/依赖不可用，抛出可读错误信息。
     - 支持 CUDA、MPS、CPU 设备，MPS 不可用时自动降级到 CPU。
+    - 使用 sentence-transformers CrossEncoder 代替 BCEmbedding，以支持 MPS。
     """
     global _cached_reranker
 
@@ -157,11 +167,11 @@ def get_reranker() -> Optional[Any]:
         device = resolve_embedding_device()
 
         try:
-            from BCEmbedding.models import RerankerModel  # type: ignore
+            from sentence_transformers import CrossEncoder  # type: ignore
         except Exception as e:
             raise RuntimeError(
-                "已启用 RAG_USE_RERANKER=1，但无法导入 BCEmbedding reranker。\n"
-                "解决：确认已安装 bcembedding/BCEmbedding，或设置 RAG_USE_RERANKER=0 关闭重排。\n"
+                "已启用 RAG_USE_RERANKER=1，但无法导入 sentence-transformers CrossEncoder。\n"
+                "解决：确认已安装 sentence-transformers，或设置 RAG_USE_RERANKER=0 关闭重排。\n"
                 f"导入错误：{type(e).__name__}: {e}"
             ) from e
 
@@ -184,14 +194,14 @@ def get_reranker() -> Optional[Any]:
                     print("[RAG_RERANK] INFO fallback_to_cpu success", flush=True)
                 except Exception as e2:
                     raise RuntimeError(
-                        "BCEmbedding reranker 模型加载失败（MPS 和 CPU 均失败）。\n"
+                        "Reranker 模型加载失败（MPS 和 CPU 均失败）。\n"
                         f"model={model_name}\n"
                         f"MPS 错误：{type(e).__name__}: {e}\n"
                         f"CPU 错误：{type(e2).__name__}: {e2}"
                     ) from e2
             else:
                 raise RuntimeError(
-                    "BCEmbedding reranker 模型加载失败。\n"
+                    "Reranker 模型加载失败。\n"
                     f"model={model_name} device={device}\n"
                     f"错误：{type(e).__name__}: {e}"
                 ) from e
