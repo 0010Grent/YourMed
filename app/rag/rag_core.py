@@ -70,6 +70,54 @@ def _safe_query_for_log(query: str) -> str:
     return f"{prefix}…(sha256={_sha256_text(q)[:12]})"
 
 
+def _rewrite_query_slimming(query: str) -> str:
+    """
+    利用 DeepSeek 大模型将患者的碎碎念转化为医学核心关键词。
+    """
+    try:
+        import os
+        from openai import OpenAI
+
+        # 1. 初始化 DeepSeek 客户端
+        client = OpenAI(
+            api_key=os.getenv("DEEPSEEK_API_KEY"),
+            base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        )
+
+        # 2. 读取prompt模板
+        from app.agent.prompts import QUERY_SLIMMING_SYSTEM, QUERY_SLIMMING_USER_TEMPLATE
+
+        # 3. 构造用户消息
+        user_message = QUERY_SLIMMING_USER_TEMPLATE.format(user_message=query)
+
+        # 4. 调用API
+        response = client.chat.completions.create(
+            model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+            messages=[
+                {"role": "system", "content": QUERY_SLIMMING_SYSTEM},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=0.0,
+            max_tokens=500,
+            timeout=10
+        )
+
+        slimming_q = response.choices[0].message.content.strip()
+
+        # 5. 演示日志
+        print("\n" + "—" * 40)
+        print("【M1 检索优化：DeepSeek 语义提纯】")
+        print(f"原始提问: {query[:50]}...")
+        print(f"瘦身结果: {slimming_q}")
+        print("—" * 40 + "\n")
+
+        return slimming_q if slimming_q else query
+
+    except Exception as e:
+        print(f"⚠️  瘦身功能异常 ({type(e).__name__}: {str(e)[:100]})，已切换至原始检索。")
+        return query
+
+
 def _env_provider() -> str:
     # 新变量优先，兼容旧变量
     v = (env_str("RAG_PROVIDER", "") or env_str("RAG_EMBEDDINGS_PROVIDER", "") or "bce").strip().lower()
@@ -400,12 +448,20 @@ def retrieve(
     if not q:
         return []
 
+    # === [M1 检索优化：触发瘦身逻辑] ===
+    # 策略：长度超过 15 个字才瘦身，短句直接检索
+    search_q = q
+    if len(q) > 15:
+        search_q = _rewrite_query_slimming(q)
+    # =============================
+
     k = int(top_k) if top_k and int(top_k) > 0 else 5
     n = int(top_n) if top_n is not None else _env_top_n_default()
     if n < k:
         n = k
 
-    docs_scores = _vector_search(q, top_n=n, department=department)
+    # 使用 search_q 进行向量召回
+    docs_scores = _vector_search(search_q, top_n=n, department=department)
 
     items: List[Dict[str, Any]] = []
     for i, (doc, score) in enumerate(docs_scores, start=1):
@@ -418,6 +474,7 @@ def retrieve(
     # 是否启用 rerank：入参优先，其次环境变量
     do_rerank = _env_use_reranker() if use_rerank is None else bool(use_rerank)
     if do_rerank and items:
+        # 重排建议使用原句 q，因为精排模型需要上下文
         items = _apply_rerank(q, items)
 
     # 截断 top_k，并重建 eid 连续
